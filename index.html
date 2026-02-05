@@ -291,6 +291,9 @@ function MatrikaLab() {
   const [selectedBijaInfo, setSelectedBijaInfo] = useState(null);
   const [showYantraDuringPlay, setShowYantraDuringPlay] = useState(true);
   const [speed, setSpeed] = useState(1); // 0.5 = slow, 1 = normal, 2 = fast
+  const [isPaused, setIsPaused] = useState(false);
+  const [continuousMode, setContinuousMode] = useState(false);
+  const [fullscreenYantra, setFullscreenYantra] = useState(false);
   const [sankalpaInput, setSankalpaInput] = useState('');
   const [sankalpaLoading, setSankalpaLoading] = useState(false);
   const [sankalpaSubmitted, setSankalpaSubmitted] = useState(false);
@@ -300,6 +303,9 @@ function MatrikaLab() {
   const canvasRef = useRef(null);
   const audioContextRef = useRef(null);
   const stopRequestedRef = useRef(false);
+  const pausedRef = useRef(false);
+  const speedRef = useRef(speed);
+  const continuousModeRef = useRef(continuousMode);
   const particlesRef = useRef([]);
   const animationRef = useRef(null);
   const timeRef = useRef(0);
@@ -403,6 +409,11 @@ function MatrikaLab() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
+  // Keep refs in sync with state for real-time changes during playback
+  useEffect(() => { speedRef.current = speed; }, [speed]);
+  useEffect(() => { pausedRef.current = isPaused; }, [isPaused]);
+  useEffect(() => { continuousModeRef.current = continuousMode; }, [continuousMode]);
+
   // Animation loop
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -428,8 +439,8 @@ function MatrikaLab() {
     return () => { if (animationRef.current) cancelAnimationFrame(animationRef.current); };
   }, [activeLetters]);
 
-  // Play grouped bija
-  const playGroupedBija = useCallback((bijaKey, duration) => {
+  // Play grouped bija with optional continuous flow mode
+  const playGroupedBija = useCallback((bijaKey, duration, isContinuous = false) => {
     const bija = BIJA_COMPOUNDS[bijaKey];
     if (!bija) return;
     const ctx = getAudioContext();
@@ -437,79 +448,138 @@ function MatrikaLab() {
     masterGain.connect(ctx.destination);
     const oscillators = [];
     const components = bija.components.map(r => findLetter(r)).filter(Boolean);
-    
+
+    // In continuous mode: longer, smoother fades for swelling effect
+    const fadeIn = isContinuous ? 0.4 : 0.1;
+    const fadeOut = isContinuous ? 0.5 : 0.3;
+
     components.forEach((letter, index) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'sine';
       osc.frequency.setValueAtTime(letter.freq, ctx.currentTime);
-      const stagger = index * 0.08;
+      const stagger = isContinuous ? index * 0.05 : index * 0.08; // Tighter stagger in continuous
       const dur = (duration / 1000) - stagger;
+      const peakVol = volume * 0.6;
+
       gain.gain.setValueAtTime(0, ctx.currentTime + stagger);
-      gain.gain.linearRampToValueAtTime(volume * 0.6, ctx.currentTime + stagger + 0.1);
-      gain.gain.setValueAtTime(volume * 0.6, ctx.currentTime + stagger + dur * 0.7);
-      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + stagger + dur);
+      // Smooth exponential fade in for swelling effect
+      if (isContinuous) {
+        gain.gain.exponentialRampToValueAtTime(Math.max(peakVol, 0.001), ctx.currentTime + stagger + fadeIn);
+        gain.gain.setValueAtTime(peakVol, ctx.currentTime + stagger + fadeIn);
+        gain.gain.setValueAtTime(peakVol, ctx.currentTime + stagger + dur - fadeOut);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + stagger + dur);
+      } else {
+        gain.gain.linearRampToValueAtTime(peakVol, ctx.currentTime + stagger + fadeIn);
+        gain.gain.setValueAtTime(peakVol, ctx.currentTime + stagger + dur * 0.7);
+        gain.gain.linearRampToValueAtTime(0, ctx.currentTime + stagger + dur);
+      }
       osc.connect(gain);
       gain.connect(masterGain);
       osc.start(ctx.currentTime + stagger);
       osc.stop(ctx.currentTime + stagger + dur + 0.1);
       oscillators.push(osc);
-      
-      // Harmonic
+
+      // Harmonic - smoother in continuous mode
       const osc2 = ctx.createOscillator();
       const gain2 = ctx.createGain();
       osc2.type = 'triangle';
       osc2.frequency.setValueAtTime(letter.freq * 2, ctx.currentTime);
+      const harmVol = volume * (isContinuous ? 0.12 : 0.15);
       gain2.gain.setValueAtTime(0, ctx.currentTime + stagger);
-      gain2.gain.linearRampToValueAtTime(volume * 0.15, ctx.currentTime + stagger + 0.1);
-      gain2.gain.linearRampToValueAtTime(0, ctx.currentTime + stagger + dur);
+      if (isContinuous) {
+        gain2.gain.exponentialRampToValueAtTime(Math.max(harmVol, 0.001), ctx.currentTime + stagger + fadeIn);
+        gain2.gain.setValueAtTime(harmVol, ctx.currentTime + stagger + dur - fadeOut);
+        gain2.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + stagger + dur);
+      } else {
+        gain2.gain.linearRampToValueAtTime(harmVol, ctx.currentTime + stagger + fadeIn);
+        gain2.gain.linearRampToValueAtTime(0, ctx.currentTime + stagger + dur);
+      }
       osc2.connect(gain2);
       gain2.connect(masterGain);
       osc2.start(ctx.currentTime + stagger);
       osc2.stop(ctx.currentTime + stagger + dur + 0.1);
     });
-    
+
     setActiveLetters(components);
-    setTimeout(() => { masterGain.disconnect(); }, duration + 200);
+    setTimeout(() => { masterGain.disconnect(); }, duration + 500);
   }, [getAudioContext, volume]);
+
+  // Helper to wait while paused
+  const waitWhilePaused = async () => {
+    while (pausedRef.current && !stopRequestedRef.current) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+  };
 
   // Play sequence
   const playSequence = useCallback(async () => {
     if (groupedBijaSequence.length === 0 || isPlaying) return;
     setIsPlaying(true);
+    setIsPaused(false);
     setCurrentRep(0);
     stopRequestedRef.current = false;
-    
-    // Calculate actual durations based on speed (higher speed = shorter duration)
-    const actualBijaDuration = Math.round(bijaDuration / speed);
-    const actualSilenceDuration = Math.round(silenceDuration / speed);
-    
+    pausedRef.current = false;
+
     for (let rep = 0; rep < repetitions; rep++) {
       if (stopRequestedRef.current) break;
+      await waitWhilePaused();
+      if (stopRequestedRef.current) break;
       setCurrentRep(rep + 1);
-      
+
       for (let i = 0; i < groupedBijaSequence.length; i++) {
         if (stopRequestedRef.current) break;
+        await waitWhilePaused();
+        if (stopRequestedRef.current) break;
+
         const bijaKey = groupedBijaSequence[i];
         const bija = BIJA_COMPOUNDS[bijaKey];
         if (bija) {
+          // Calculate durations using current speed (from ref for real-time updates)
+          const actualBijaDuration = Math.round(bijaDuration / speedRef.current);
+          const actualSilenceDuration = Math.round(silenceDuration / speedRef.current);
+          const isContinuous = continuousModeRef.current;
+
           setCurrentBija({ key: bijaKey, ...bija });
-          playGroupedBija(bijaKey, actualBijaDuration);
-          await new Promise(r => setTimeout(r, actualBijaDuration));
-          setActiveLetters([]);
-          setCurrentBija(null);
-          if (i < groupedBijaSequence.length - 1) await new Promise(r => setTimeout(r, actualSilenceDuration));
+          playGroupedBija(bijaKey, actualBijaDuration, isContinuous);
+
+          // In continuous mode: wait less time so bijas overlap and swell into each other
+          // This creates a crossfade effect where the next bija starts while current fades
+          const waitTime = isContinuous
+            ? Math.round(actualBijaDuration * 0.6) // 60% overlap for swelling
+            : actualBijaDuration;
+          await new Promise(r => setTimeout(r, waitTime));
+
+          if (!isContinuous) {
+            setActiveLetters([]);
+            setCurrentBija(null);
+          }
+          // In non-continuous mode, add silence between bijas
+          if (i < groupedBijaSequence.length - 1 && !isContinuous) {
+            await new Promise(r => setTimeout(r, actualSilenceDuration));
+          }
         }
       }
-      if (rep < repetitions - 1 && !stopRequestedRef.current) await new Promise(r => setTimeout(r, actualSilenceDuration * 2));
+      // At end of repetition in continuous mode, let the last bija fade out
+      if (continuousModeRef.current) {
+        const actualBijaDuration = Math.round(bijaDuration / speedRef.current);
+        await new Promise(r => setTimeout(r, actualBijaDuration * 0.5)); // Wait for fade out
+        setActiveLetters([]);
+        setCurrentBija(null);
+      }
+      // Brief pause between repetitions
+      const actualSilenceDuration = Math.round(silenceDuration / speedRef.current);
+      if (rep < repetitions - 1 && !stopRequestedRef.current) await new Promise(r => setTimeout(r, actualSilenceDuration));
     }
     setActiveLetters([]);
     setCurrentBija(null);
     setIsPlaying(false);
+    setIsPaused(false);
     setCurrentRep(0);
-  }, [groupedBijaSequence, isPlaying, repetitions, bijaDuration, silenceDuration, speed, playGroupedBija]);
+  }, [groupedBijaSequence, isPlaying, repetitions, bijaDuration, silenceDuration, playGroupedBija]);
 
-  const stopPlayback = () => { stopRequestedRef.current = true; };
+  const stopPlayback = () => { stopRequestedRef.current = true; setIsPaused(false); };
+  const togglePause = () => { setIsPaused(p => !p); };
 
   // Styles
   const containerStyle = { minHeight: '100vh', background: 'linear-gradient(145deg, #0c0a08 0%, #1a1510 50%, #0d0b09 100%)', color: '#e8e0d5', fontFamily: '"Cormorant Garamond", Georgia, serif', padding: '20px' };
@@ -599,7 +669,7 @@ function MatrikaLab() {
           e('label', { style: { fontSize: '0.7rem', color: '#706060', display: 'block' } }, 'SPEED'),
           e('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' } },
             e('span', { style: { fontSize: '0.7rem', color: '#605050' } }, 'Slow'),
-            e('input', { type: 'range', min: 0.25, max: 3, step: 0.25, value: speed, onChange: ev => setSpeed(parseFloat(ev.target.value)), disabled: isPlaying, style: { flex: 1, accentColor: '#c9a066' } }),
+            e('input', { type: 'range', min: 0.25, max: 3, step: 0.25, value: speed, onChange: ev => setSpeed(parseFloat(ev.target.value)), style: { flex: 1, accentColor: '#c9a066' } }),
             e('span', { style: { fontSize: '0.7rem', color: '#605050' } }, 'Fast')
           ),
           e('div', { style: { fontSize: '0.7rem', color: '#807060', textAlign: 'center', marginBottom: '12px' } }, speed === 1 ? 'Normal' : speed < 1 ? (1/speed).toFixed(1) + '× slower' : speed.toFixed(1) + '× faster'),
@@ -608,9 +678,19 @@ function MatrikaLab() {
           e('input', { type: 'range', min: 0, max: 1, step: 0.01, value: volume, onChange: ev => setVolume(parseFloat(ev.target.value)), style: { width: '100%', accentColor: '#c9a066', marginBottom: '12px' } }),
           
           // Yantra toggle
-          e('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.75rem', color: '#908070' } },
+          e('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.75rem', color: '#908070', marginBottom: '8px' } },
             e('input', { type: 'checkbox', checked: showYantraDuringPlay, onChange: ev => setShowYantraDuringPlay(ev.target.checked), style: { accentColor: '#7a9a7a' } }),
             'Show yantra during playback'
+          ),
+          // Continuous mode toggle
+          e('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.75rem', color: '#908070', marginBottom: '8px' } },
+            e('input', { type: 'checkbox', checked: continuousMode, onChange: ev => setContinuousMode(ev.target.checked), style: { accentColor: '#a07a9a' } }),
+            'Continuous flow (no gaps between bījas)'
+          ),
+          // Fullscreen yantra toggle
+          e('label', { style: { display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.75rem', color: '#908070' } },
+            e('input', { type: 'checkbox', checked: fullscreenYantra, onChange: ev => setFullscreenYantra(ev.target.checked), style: { accentColor: '#7a9a7a' } }),
+            'Fullscreen yantra'
           )
         ),
         
@@ -663,10 +743,13 @@ function MatrikaLab() {
                   return bija ? e('span', { key: i, style: { fontSize: '2rem', fontFamily: '"Noto Sans Devanagari", sans-serif', color: '#d4b4e4', textShadow: '0 0 20px rgba(180,140,200,0.4)' } }, bija.devanagari) : null;
                 })
           ),
-          e('div', null,
+          e('div', { style: { display: 'flex', gap: '8px' } },
             !isPlaying
               ? e('button', { style: buttonStyle, onClick: playSequence, disabled: groupedBijaSequence.length === 0 }, '▶ Play (', repetitions, '×)')
-              : e('button', { style: { ...buttonStyle, background: 'linear-gradient(145deg, rgba(180,100,100,0.2), rgba(160,80,80,0.1))', borderColor: 'rgba(180,100,100,0.3)', color: '#d4a4a4' }, onClick: stopPlayback }, '◼ Stop')
+              : [
+                  e('button', { key: 'pause', style: { ...buttonStyle, background: isPaused ? 'linear-gradient(145deg, rgba(100,180,100,0.2), rgba(80,160,80,0.1))' : 'linear-gradient(145deg, rgba(180,160,100,0.2), rgba(160,140,80,0.1))', borderColor: isPaused ? 'rgba(100,180,100,0.3)' : 'rgba(180,160,100,0.3)', color: isPaused ? '#a4d4a4' : '#d4c4a4' }, onClick: togglePause }, isPaused ? '▶ Resume' : '⏸ Pause'),
+                  e('button', { key: 'stop', style: { ...buttonStyle, background: 'linear-gradient(145deg, rgba(180,100,100,0.2), rgba(160,80,80,0.1))', borderColor: 'rgba(180,100,100,0.3)', color: '#d4a4a4' }, onClick: stopPlayback }, '◼ Stop')
+                ]
           )
         )
       )
@@ -707,6 +790,44 @@ function MatrikaLab() {
       sankalpaSubmitted && e('div', { style: { padding: '12px 16px', background: 'rgba(100, 180, 100, 0.1)', border: '1px solid rgba(100, 180, 100, 0.3)', borderRadius: '8px', color: '#a0c0a0', fontSize: '0.9rem' } },
         'Your intention has been set.'
       )
+    ),
+    // Fullscreen Yantra Overlay
+    fullscreenYantra && e('div', {
+      style: {
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        background: 'rgba(12, 10, 8, 0.95)',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+        cursor: 'pointer'
+      },
+      onClick: () => setFullscreenYantra(false)
+    },
+      e('img', {
+        src: YANTRA_IMAGE,
+        style: {
+          width: 'min(80vw, 80vh)',
+          height: 'min(80vw, 80vh)',
+          borderRadius: '16px',
+          boxShadow: '0 0 120px rgba(100, 180, 100, 0.4)'
+        }
+      }),
+      // Playback controls at bottom
+      e('div', { style: { position: 'absolute', bottom: '40px', display: 'flex', gap: '12px' }, onClick: ev => ev.stopPropagation() },
+        !isPlaying
+          ? e('button', { style: buttonStyle, onClick: playSequence, disabled: groupedBijaSequence.length === 0 }, '▶ Play (', repetitions, '×)')
+          : [
+              e('button', { key: 'pause', style: { ...buttonStyle, background: isPaused ? 'linear-gradient(145deg, rgba(100,180,100,0.2), rgba(80,160,80,0.1))' : 'linear-gradient(145deg, rgba(180,160,100,0.2), rgba(160,140,80,0.1))', borderColor: isPaused ? 'rgba(100,180,100,0.3)' : 'rgba(180,160,100,0.3)', color: isPaused ? '#a4d4a4' : '#d4c4a4' }, onClick: togglePause }, isPaused ? '▶ Resume' : '⏸ Pause'),
+              e('button', { key: 'stop', style: { ...buttonStyle, background: 'linear-gradient(145deg, rgba(180,100,100,0.2), rgba(160,80,80,0.1))', borderColor: 'rgba(180,100,100,0.3)', color: '#d4a4a4' }, onClick: stopPlayback }, '◼ Stop')
+            ]
+      ),
+      e('div', { style: { position: 'absolute', bottom: '15px', fontSize: '0.7rem', color: '#605050' } }, 'Click anywhere to exit fullscreen')
     )
   );
 }
